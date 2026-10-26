@@ -1,0 +1,250 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+EXTRA_COMMANDS="check verify show release_irqs"
+EXTRA_HELP="	check [irq_mode] [processing]	Check the hardware layout and selected modes without changes
+	verify	Verify the selected controller and live profile
+	show	Show the selected mode and live settings
+	release_irqs	Release Ethernet IRQ masks while irqbalance is stopped"
+
+queues=/sys/class/net/eth0/queues
+
+irq_for() {
+	printf '%s\n' "$irqs" | awk -v label="c080000.ethernet:$1" '$2 == label {print $1}'
+}
+
+set_mask() {
+	printf '%s\n' "$2" > "$1"
+	[ "$(cat "$1")" = "$2" ]
+}
+
+set_task() {
+	taskset -p -c "$2" "$1" >/dev/null
+	[ "$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' "/proc/$1/status")" = "$2" ]
+}
+
+load_profile() {
+	[ "$(cat /tmp/sysinfo/board_name)" = avm,fritzbox-7530 ] &&
+		[ "$(cat /sys/devices/system/cpu/online)" = 0-3 ] &&
+		[ -w /sys/class/net/eth0/threaded ] || {
+		echo 'Expected FRITZ!Box 7530, CPUs 0-3, and writable eth0 NAPI mode' >&2
+		return 1
+	}
+	case "$(cat /sys/class/net/eth0/threaded)" in
+		0|1) ;;
+		*) echo 'Unsupported eth0 NAPI mode' >&2; return 1 ;;
+	esac
+	command -v taskset >/dev/null || return 1
+	irqs=$(awk '/c080000.ethernet:(rxq|txq)[0-9]+$/ {sub(/:$/, "", $1); print $1, $NF}' /proc/interrupts)
+	[ "$(printf '%s\n' "$irqs" | wc -l)" -eq 8 ] || {
+		echo 'Expected four RX and four TX Ethernet IRQs' >&2
+		return 1
+	}
+	tasks=$(
+		for path in /proc/[0-9]*/comm; do
+			name=$(cat "$path" 2>/dev/null) || continue
+			case "$name" in
+				napi/eth0-*) pid=${path%/comm}; printf '%s %s\n' "${pid##*/}" "$name" ;;
+			esac
+		done
+	)
+	# TX threads share a name; descending PID order defines their queue mapping.
+	tx_pids=$(printf '%s\n' "$tasks" | awk '$2 == "napi/eth0-0" {print $1}' | sort -rn)
+	[ "$(printf '%s\n' "$tasks" | wc -l)" -eq 8 ] &&
+		[ "$(printf '%s\n' "$tx_pids" | wc -l)" -eq 4 ] || {
+		echo 'Expected four RX and four TX NAPI threads' >&2
+		return 1
+	}
+	for i in 0 1 2 3; do
+		[ "$(printf '%s\n' "$tasks" | awk -v name="napi/eth0-$((i + 5))" '$2 == name {n++} END {print n+0}')" -eq 1 ] &&
+			[ -w "$queues/tx-$i/xps_cpus" ] &&
+			[ "$(cat "$queues/rx-$i/rps_cpus")" = "$((1 << ((i + 1) % 4)))" ] || {
+			echo "Queue $i differs from the benchmarked NAPI/RPS layout" >&2
+			return 1
+		}
+		[ -w "/proc/irq/$(irq_for "rxq$((i * 2))")/smp_affinity" ] &&
+			[ -w "/proc/irq/$(irq_for "txq$((i * 4))")/smp_affinity" ] || {
+			echo "Queue $i is missing a writable RX/TX IRQ affinity" >&2
+			return 1
+		}
+	done
+}
+
+load_mode() {
+	mode=${1:-$(uci -q get napi_xps.main.irq_mode || true)}
+	case "$mode" in
+		manual|irqbalance) ;;
+		*) echo 'Select an IRQ mode with install.sh manual|irqbalance' >&2; return 1 ;;
+	esac
+}
+
+load_processing() {
+	processing=${1:-$(uci -q get napi_xps.main.processing || echo threaded)}
+	case "$processing" in
+		threaded|softirq) ;;
+		*) echo 'processing must be threaded or softirq' >&2; return 1 ;;
+	esac
+	if [ "$processing" = softirq ] && [ "$mode" != manual ]; then
+		echo 'The softirq profile requires manual IRQ placement' >&2
+		return 1
+	fi
+}
+
+threaded_value() {
+	if [ "$processing" = softirq ]; then echo 0; else echo 1; fi
+}
+
+# Queue i selects CPU i in either processing mode.
+xps_mask() {
+	echo "$((1 << $1))"
+}
+
+check() (
+	set -eu
+	load_mode "${1:-}"
+	load_processing "${2:-}"
+	load_profile
+)
+
+check_controller() {
+	if [ "$mode" = manual ]; then
+		if pidof irqbalance >/dev/null; then
+			echo 'Stop irqbalance before using the manual IRQ profile' >&2
+			return 1
+		fi
+	else
+		if ! pidof irqbalance >/dev/null; then
+			echo 'irqbalance mode requires its installed, running service; rerun install.sh irqbalance' >&2
+			return 1
+		fi
+	fi
+}
+
+# Exclude the CPU selected by RPS for this RX queue.
+rx_cpus() {
+	case "$1" in
+		0) echo 0,2-3 ;; 1) echo 0-1,3 ;; 2) echo 0-2 ;; 3) echo 1-3 ;;
+	esac
+}
+
+release_irqs() (
+	set -eu
+	! pidof irqbalance >/dev/null || {
+		echo 'Stop irqbalance before releasing Ethernet IRQ masks' >&2
+		exit 1
+	}
+	load_profile
+	for irq in $(printf '%s\n' "$irqs" | awk '{print $1}'); do
+		set_mask "/proc/irq/$irq/smp_affinity" f
+	done
+)
+
+start() (
+	set -eu
+	load_mode
+	load_processing
+	load_profile
+	check_controller
+	set -- $tx_pids
+	for i in 0 1 2 3; do
+		mask=$((1 << i))
+		if [ "$mode" = manual ]; then
+			set_mask "/proc/irq/$(irq_for "rxq$((i * 2))")/smp_affinity" "$mask"
+			set_mask "/proc/irq/$(irq_for "txq$((i * 4))")/smp_affinity" "$((1 << ((i + 1) % 4)))"
+		fi
+		set_mask "$queues/tx-$i/xps_cpus" "$(xps_mask "$i")"
+		set_task "$1" "$(((i + 1) % 4))"
+		shift
+		cpus=$(rx_cpus "$i")
+		pid=$(printf '%s\n' "$tasks" | awk -v name="napi/eth0-$((i + 5))" '$2 == name {print $1}')
+		set_task "$pid" "$cpus"
+	done
+	set_mask /sys/class/net/eth0/threaded "$(threaded_value)"
+)
+
+reload() {
+	start
+}
+
+stop() (
+	set -eu
+	set_mask /sys/class/net/eth0/threaded 1
+	# Leave another active controller's IRQ assignments alone.
+	if ! pidof irqbalance >/dev/null; then
+		for irq in $(awk '/c080000.ethernet:(rxq|txq)[0-9]+$/ {sub(/:$/, "", $1); print $1}' /proc/interrupts); do
+			set_mask "/proc/irq/$irq/smp_affinity" f
+		done
+	fi
+	# Stock packet steering restores its NAPI policy after uninstall removes the hook.
+	for i in 0 1 2 3; do
+		if [ -w "$queues/tx-$i/xps_cpus" ]; then
+			printf '0\n' > "$queues/tx-$i/xps_cpus"
+		fi
+	done
+	for path in /proc/[0-9]*/comm; do
+		name=$(cat "$path" 2>/dev/null) || continue
+		case "$name" in
+			napi/eth0-*) pid=${path%/comm}; taskset -p -c 0-3 "${pid##*/}" >/dev/null ;;
+		esac
+	done
+)
+
+verify() (
+	set -eu
+	load_mode
+	load_processing
+	load_profile
+	check_controller
+	[ "$(cat /sys/class/net/eth0/threaded)" = "$(threaded_value)" ]
+	if [ "$mode" = manual ]; then
+		if [ -x /etc/init.d/irqbalance ]; then
+			! /etc/init.d/irqbalance enabled || { echo 'Disable irqbalance at boot in manual mode' >&2; exit 1; }
+		fi
+	else
+		/etc/init.d/irqbalance enabled
+		[ "$(uci -q get irqbalance.irqbalance.enabled)" = 1 ]
+		[ "$(uci -q get irqbalance.irqbalance.deepestcache)" = 2 ]
+		[ "$(uci -q get irqbalance.irqbalance.interval)" = 10 ]
+		[ "$(uci -q get irqbalance.irqbalance.debug)" = 0 ]
+		for option in banirq banmod banclass exclude_cpus; do
+			[ -z "$(uci -q get "irqbalance.irqbalance.$option")" ]
+		done
+	fi
+	set -- $tx_pids
+	for i in 0 1 2 3; do
+		[ "$(cat "$queues/tx-$i/xps_cpus")" = "$(xps_mask "$i")" ]
+		[ "$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' "/proc/$1/status")" = "$(((i + 1) % 4))" ]
+		shift
+		pid=$(printf '%s\n' "$tasks" | awk -v name="napi/eth0-$((i + 5))" '$2 == name {print $1}')
+		[ "$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' "/proc/$pid/status")" = "$(rx_cpus "$i")" ]
+		if [ "$mode" = manual ]; then
+			for spec in "rxq$((i * 2)):$((1 << i))" "txq$((i * 4)):$((1 << ((i + 1) % 4)))"; do
+				irq=$(irq_for "${spec%:*}"); mask=${spec#*:}
+				[ "$(cat "/proc/irq/$irq/smp_affinity")" = "$mask" ]
+				if [ -r "/proc/irq/$irq/effective_affinity" ]; then
+					[ "$(cat "/proc/irq/$irq/effective_affinity")" = "$mask" ]
+				fi
+			done
+		fi
+	done
+	echo "NAPI/XPS profile verified: $mode IRQs, $processing processing."
+)
+
+show() {
+	load_mode || return 1
+	load_processing || return 1
+	echo "IRQ mode: $mode; processing: $processing; threaded=$(cat /sys/class/net/eth0/threaded)"
+	for i in 0 1 2 3; do
+		echo "RX$i RPS=$(cat "$queues/rx-$i/rps_cpus") TX$i XPS=$(cat "$queues/tx-$i/xps_cpus")"
+	done
+	awk '/c080000.ethernet:(rxq|txq)[0-9]+$/ {sub(/:$/, "", $1); print $1, $NF}' /proc/interrupts | while read -r irq name; do
+		echo "$name IRQ$irq mask=$(cat "/proc/irq/$irq/smp_affinity")"
+	done
+	for path in /proc/[0-9]*/comm; do
+		name=$(cat "$path" 2>/dev/null) || continue
+		case "$name" in
+			napi/eth0-*) pid=${path%/comm}; echo "$name PID${pid##*/} CPUs=$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' "$pid/status")" ;;
+		esac
+	done
+}
